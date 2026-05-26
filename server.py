@@ -5,16 +5,23 @@ import json
 import platform
 import re
 import subprocess
+import sys
 import tempfile
 import urllib.parse
+import uuid
 import zlib
+from datetime import date as _date
 from pathlib import Path
 
 import yaml
 
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("hayabusa")
+_sse_mode = "--sse" in sys.argv
+_http_mode = "--streamable-http" in sys.argv
+_remote_mode = _sse_mode or _http_mode
+_sse_port = next((int(a.split("=")[1]) for a in sys.argv if a.startswith("--port=")), 8001)
+mcp = FastMCP("hayabusa", host="0.0.0.0" if _remote_mode else "127.0.0.1", port=_sse_port)
 
 SEVERITY_LEVELS = ["informational", "low", "medium", "high", "critical"]
 
@@ -210,6 +217,629 @@ def get_hayabusa_rules(
         "returned": len(rules),
         "rules": rules,
     }
+
+
+# ── Sigma rule resources ───────────────────────────────────────────────────
+
+_SIGMA_RULES_DIR = Path(__file__).parent / "rules"
+
+
+def _load_sigma_rules() -> list[tuple[Path, dict]]:
+    if not _SIGMA_RULES_DIR.exists():
+        return []
+    results = []
+    for yml in sorted(_SIGMA_RULES_DIR.rglob("*.yml")):
+        try:
+            data = yaml.safe_load(yml.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(data, dict) and "title" in data:
+                results.append((yml, data))
+        except Exception:
+            continue
+    return results
+
+
+def _extract_techniques(data: dict) -> list[str]:
+    techniques = []
+    for tag in data.get("tags") or []:
+        m = re.match(r"attack\.(t\d+(?:\.\d+)?)", tag, re.IGNORECASE)
+        if m:
+            techniques.append(m.group(1).upper())
+    return techniques
+
+
+def _rule_summary(path: Path, data: dict) -> dict:
+    return {
+        "name": path.stem,
+        "title": data.get("title", ""),
+        "id": data.get("id", ""),
+        "level": data.get("level", ""),
+        "status": data.get("status", ""),
+        "techniques": _extract_techniques(data),
+        "path": str(path.relative_to(_SIGMA_RULES_DIR)),
+    }
+
+
+@mcp.resource(
+    "detection://rules",
+    description="List all available Sigma detection rules with metadata and ATT&CK technique mappings.",
+    mime_type="application/json",
+)
+def list_sigma_rules() -> str:
+    rules = [_rule_summary(p, d) for p, d in _load_sigma_rules()]
+    return json.dumps({"total": len(rules), "rules": rules}, indent=2)
+
+
+@mcp.resource(
+    "detection://rules/{rule_name}",
+    description="Get the full YAML content of a specific Sigma rule by its file stem (e.g. proc_creation_win_whoami).",
+    mime_type="text/plain",
+)
+def get_sigma_rule(rule_name: str) -> str:
+    if not _SIGMA_RULES_DIR.exists():
+        return json.dumps({"error": f"Rules directory not found: {_SIGMA_RULES_DIR}"})
+    for path in sorted(_SIGMA_RULES_DIR.rglob("*.yml")):
+        if path.stem == rule_name:
+            return path.read_text(encoding="utf-8", errors="replace")
+    return json.dumps({"error": f"Rule '{rule_name}' not found"})
+
+
+@mcp.resource(
+    "detection://rules/by-technique/{technique_id}",
+    description="List all Sigma rules that cover a specific ATT&CK technique (e.g. T1059, T1059.001).",
+    mime_type="application/json",
+)
+def get_rules_by_technique(technique_id: str) -> str:
+    needle = technique_id.upper()
+    matches = [
+        _rule_summary(p, d)
+        for p, d in _load_sigma_rules()
+        if needle in _extract_techniques(d)
+    ]
+    return json.dumps(
+        {"technique_id": needle, "total": len(matches), "rules": matches},
+        indent=2,
+    )
+
+
+# ── ATT&CK technique resource ──────────────────────────────────────────────
+
+_ATTACK_DATA_PATH = Path(__file__).parent / "mappings" / "enterprise-attack.json"
+
+# Lazily populated on first use: technique_id (e.g. "T1059.001") -> {name, description, is_subtechnique}
+_attack_index: dict[str, dict] | None = None
+
+
+def _get_attack_index() -> dict[str, dict]:
+    global _attack_index
+    if _attack_index is not None:
+        return _attack_index
+
+    if not _ATTACK_DATA_PATH.exists():
+        _attack_index = {}
+        return _attack_index
+
+    with _ATTACK_DATA_PATH.open(encoding="utf-8") as fh:
+        stix = json.load(fh)
+
+    index: dict[str, dict] = {}
+    for obj in stix.get("objects", []):
+        if obj.get("type") != "attack-pattern":
+            continue
+        if obj.get("revoked") or obj.get("x_mitre_deprecated"):
+            continue
+        ext_id = next(
+            (ref["external_id"] for ref in obj.get("external_references", [])
+             if ref.get("source_name") == "mitre-attack"),
+            None,
+        )
+        if not ext_id:
+            continue
+        tactics = [
+            phase["phase_name"].replace("-", " ").title()
+            for phase in obj.get("kill_chain_phases", [])
+            if phase.get("kill_chain_name") == "mitre-attack"
+        ]
+        index[ext_id.upper()] = {
+            "technique_id": ext_id.upper(),
+            "name": obj.get("name", ""),
+            "description": obj.get("description", ""),
+            "tactics": tactics,
+            "is_subtechnique": bool(obj.get("x_mitre_is_subtechnique")),
+            "platforms": obj.get("x_mitre_platforms", []),
+            "data_sources": obj.get("x_mitre_data_sources", []),
+            "detection": obj.get("x_mitre_detection", ""),
+        }
+
+    _attack_index = index
+    return _attack_index
+
+
+def _assess_coverage(
+    technique_id: str,
+    direct_rules: list[dict],
+    attack_index: dict[str, dict],
+) -> dict:
+    """Return coverage assessment for a technique.
+
+    - covered  : ≥1 rule maps directly to this technique ID
+    - partial  : parent technique has no direct rules but ≥1 sub-technique is covered
+    - gap      : no rules found at all
+    """
+    if direct_rules:
+        return {"status": "covered", "rule_count": len(direct_rules)}
+
+    # For parent techniques (no dot), check whether any sub-techniques are covered
+    if "." not in technique_id:
+        sigma_rules = _load_sigma_rules()
+        all_techniques_in_rules: set[str] = set()
+        for _, d in sigma_rules:
+            all_techniques_in_rules.update(_extract_techniques(d))
+
+        subtechs_in_attack = [
+            tid for tid in attack_index
+            if tid.startswith(technique_id + ".")
+        ]
+        covered_subtechs = [t for t in subtechs_in_attack if t in all_techniques_in_rules]
+
+        if covered_subtechs:
+            return {
+                "status": "partial",
+                "rule_count": 0,
+                "note": (
+                    f"{len(covered_subtechs)}/{len(subtechs_in_attack)} sub-techniques covered: "
+                    + ", ".join(sorted(covered_subtechs))
+                ),
+            }
+
+    return {"status": "gap", "rule_count": 0}
+
+
+@mcp.resource(
+    "detection://attack/techniques/{technique_id}",
+    description=(
+        "ATT&CK technique details plus Sigma rule coverage. "
+        "technique_id examples: T1059, T1059.001. "
+        "Coverage is 'covered' (direct rules exist), "
+        "'partial' (parent technique with sub-technique coverage), or 'gap' (no rules)."
+    ),
+    mime_type="application/json",
+)
+def get_attack_technique(technique_id: str) -> str:
+    tid = technique_id.upper()
+    attack_index = _get_attack_index()
+
+    technique = attack_index.get(tid)
+    if technique is None:
+        if not _ATTACK_DATA_PATH.exists():
+            return json.dumps({
+                "error": (
+                    f"ATT&CK data not found at {_ATTACK_DATA_PATH}. "
+                    "Download enterprise-attack.json into the mappings/ directory."
+                )
+            })
+        return json.dumps({"error": f"Technique '{tid}' not found in ATT&CK data"})
+
+    sigma_rules = _load_sigma_rules()
+    direct_rules = [
+        _rule_summary(p, d)
+        for p, d in sigma_rules
+        if tid in _extract_techniques(d)
+    ]
+
+    coverage = _assess_coverage(tid, direct_rules, attack_index)
+
+    return json.dumps({
+        "technique_id": technique["technique_id"],
+        "name": technique["name"],
+        "description": technique["description"],
+        "tactics": technique["tactics"],
+        "is_subtechnique": technique["is_subtechnique"],
+        "platforms": technique["platforms"],
+        "coverage": coverage,
+        "rules": direct_rules,
+    }, indent=2)
+
+
+# ── Coverage analysis tool ────────────────────────────────────────────────
+
+
+@mcp.tool()
+def analyze_coverage(query: str) -> dict:
+    """Analyze detection coverage for an ATT&CK technique ID or tactic name.
+
+    Reads Sigma rules from the detection://rules resource and cross-references
+    them against the ATT&CK knowledge base to identify covered techniques,
+    partial coverage, and detection gaps.
+
+    Args:
+        query: An ATT&CK technique ID  (e.g. "T1003", "T1059.001")
+               or a tactic name       (e.g. "credential-access", "Lateral Movement").
+               Technique IDs are matched exactly; tactic names are matched
+               case-insensitively with hyphens/underscores treated as spaces.
+
+    Returns a coverage report with:
+      - summary: counts and percentage of covered / partial / gap techniques
+      - covered: techniques with ≥1 direct Sigma rule
+      - partial: parent techniques where sub-techniques are covered but not the parent itself
+      - gaps:    techniques with no Sigma rules at all
+    """
+    attack_index = _get_attack_index()
+
+    # Build technique -> rules mapping from Sigma rules
+    sigma_rules = _load_sigma_rules()
+    technique_to_rules: dict[str, list[dict]] = {}
+    for path, data in sigma_rules:
+        summary = _rule_summary(path, data)
+        for tid in summary["techniques"]:
+            technique_to_rules.setdefault(tid, []).append(summary)
+
+    covered_set = set(technique_to_rules.keys())
+
+    # Determine query type: technique ID vs tactic name
+    technique_id_match = re.match(r"^(T\d{4}(?:\.\d{3})?)$", query.strip(), re.IGNORECASE)
+
+    if technique_id_match:
+        # ── Technique / sub-technique ID ──────────────────────────────────
+        tid = technique_id_match.group(1).upper()
+        is_subtechnique = "." in tid
+
+        in_scope: list[str] = []
+        if tid in attack_index:
+            in_scope.append(tid)
+        if not is_subtechnique:
+            in_scope += sorted(t for t in attack_index if t.startswith(tid + "."))
+
+        if not in_scope:
+            return {
+                "error": f"Technique '{tid}' not found in ATT&CK data.",
+                "note": "Ensure mappings/enterprise-attack.json is present.",
+            }
+
+        query_type = "subtechnique" if is_subtechnique else "technique"
+        scope_label = (
+            f"{tid} and its sub-techniques"
+            if not is_subtechnique and len(in_scope) > 1
+            else tid
+        )
+
+    else:
+        # ── Tactic name ───────────────────────────────────────────────────
+        tactic_key = query.strip().lower().replace("-", " ").replace("_", " ")
+
+        in_scope = [
+            t for t, info in attack_index.items()
+            if any(tac.lower().replace("-", " ") == tactic_key for tac in info["tactics"])
+        ]
+
+        if not in_scope:
+            # Fallback: partial match
+            in_scope = [
+                t for t, info in attack_index.items()
+                if any(tactic_key in tac.lower().replace("-", " ") for tac in info["tactics"])
+            ]
+
+        if not in_scope:
+            available = sorted({
+                tac for info in attack_index.values() for tac in info["tactics"]
+            })
+            return {
+                "error": f"Tactic '{query}' not found in ATT&CK data.",
+                "available_tactics": available,
+            }
+
+        query_type = "tactic"
+        scope_label = query.strip()
+        in_scope = sorted(in_scope)
+
+    # ── Categorise each in-scope technique ────────────────────────────────
+    covered_items: list[dict] = []
+    partial_items: list[dict] = []
+    gap_items: list[dict] = []
+
+    for t in sorted(in_scope):
+        info = attack_index.get(t, {})
+        base = {
+            "technique_id": t,
+            "name": info.get("name", ""),
+            "tactics": info.get("tactics", []),
+            "is_subtechnique": info.get("is_subtechnique", False),
+        }
+        direct_rules = technique_to_rules.get(t, [])
+
+        if direct_rules:
+            severity_breakdown = {
+                lvl: sum(1 for r in direct_rules if r["level"] == lvl)
+                for lvl in SEVERITY_LEVELS
+                if any(r["level"] == lvl for r in direct_rules)
+            }
+            covered_items.append({
+                **base,
+                "rule_count": len(direct_rules),
+                "severity_breakdown": severity_breakdown,
+                "rules": direct_rules,
+            })
+        elif not info.get("is_subtechnique", True):
+            # Parent technique: check whether any sub-techniques are covered
+            subtechs = [s for s in attack_index if s.startswith(t + ".")]
+            covered_subtechs = sorted(s for s in subtechs if s in covered_set)
+            if covered_subtechs:
+                partial_items.append({
+                    **base,
+                    "rule_count": 0,
+                    "covered_subtechniques": covered_subtechs,
+                    "total_subtechniques": len(subtechs),
+                })
+            else:
+                gap_items.append({**base, "rule_count": 0})
+        else:
+            gap_items.append({**base, "rule_count": 0})
+
+    total = len(in_scope)
+    n_covered = len(covered_items)
+    n_partial = len(partial_items)
+    n_gap = len(gap_items)
+    # Partial counts as half-covered in the percentage
+    coverage_pct = round((n_covered + n_partial * 0.5) / total * 100, 1) if total else 0.0
+
+    return {
+        "query": query,
+        "query_type": query_type,
+        "scope": scope_label,
+        "summary": {
+            "total_techniques": total,
+            "covered": n_covered,
+            "partial": n_partial,
+            "gaps": n_gap,
+            "coverage_pct": coverage_pct,
+        },
+        "covered": covered_items,
+        "partial": partial_items,
+        "gaps": gap_items,
+    }
+
+
+# ── Rule suggestion tool ──────────────────────────────────────────────────
+
+# ATT&CK data source label -> Sigma logsource dict, in match-priority order
+_DS_TO_LOGSOURCE: list[tuple[str, dict]] = [
+    ("Process: Process Creation",                       {"category": "process_creation", "product": "windows"}),
+    ("Command: Command Execution",                      {"category": "process_creation", "product": "windows"}),
+    ("Process: Process Access",                         {"category": "process_access",   "product": "windows"}),
+    ("Process: OS API Execution",                       {"category": "process_access",   "product": "windows"}),
+    ("Module: Module Load",                             {"category": "image_load",        "product": "windows"}),
+    ("Driver: Driver Load",                             {"category": "driver_load",       "product": "windows"}),
+    ("Named Pipe: Named Pipe Metadata",                 {"category": "pipe_created",      "product": "windows"}),
+    ("File: File Creation",                             {"category": "file_event",        "product": "windows"}),
+    ("File: File Access",                               {"category": "file_access",       "product": "windows"}),
+    ("File: File Modification",                         {"category": "file_change",       "product": "windows"}),
+    ("File: File Deletion",                             {"category": "file_delete",       "product": "windows"}),
+    ("Windows Registry: Registry Key Modification",     {"category": "registry_set",      "product": "windows"}),
+    ("Windows Registry: Registry Key Creation",         {"category": "registry_add",      "product": "windows"}),
+    ("Windows Registry: Registry Key Deletion",         {"category": "registry_delete",   "product": "windows"}),
+    ("Script: Script Execution",                        {"category": "ps_script",         "product": "windows"}),
+    ("Network Traffic: Network Connection Creation",    {"category": "network_connection","product": "windows"}),
+    ("Network Traffic: Network Traffic Content",        {"category": "network_connection","product": "windows"}),
+    ("Active Directory: Active Directory Object Access",{"product": "windows", "service": "security"}),
+    ("User Account: User Account Authentication",       {"product": "windows", "service": "security"}),
+    ("Logon Session: Logon Session Creation",           {"product": "windows", "service": "security"}),
+    ("Application Log: Application Log Content",        {"product": "windows", "service": "application"}),
+]
+
+
+def _suggest_logsource(data_sources: list[str]) -> dict:
+    for ds_label, logsource in _DS_TO_LOGSOURCE:
+        if any(ds_label.lower() in src.lower() for src in data_sources):
+            return logsource
+    return {"category": "process_creation", "product": "windows"}
+
+
+def _build_rule_template(tid: str, info: dict) -> str:
+    logsource = _suggest_logsource(info.get("data_sources", []))
+    tactics = info.get("tactics", [])
+
+    tactic_tags = ["attack." + t.lower().replace(" ", "-") for t in tactics]
+    technique_tag = "attack." + tid.lower()
+    tags_yaml = "\n".join(f"    - {tag}" for tag in tactic_tags + [technique_tag])
+    logsource_yaml = "\n".join(f"    {k}: {v}" for k, v in logsource.items())
+
+    cat = logsource.get("category", "")
+    svc = logsource.get("service", "")
+
+    if cat == "process_creation":
+        detection_block = (
+            "detection:\n"
+            "    selection:\n"
+            "        Image|endswith:\n"
+            "            - '\\\\TODO.exe'  # tool or process name(s)\n"
+            "        CommandLine|contains:\n"
+            "            - 'TODO'  # suspicious argument patterns\n"
+            "    condition: selection\n"
+        )
+    elif cat in ("registry_set", "registry_add", "registry_event", "registry_delete"):
+        detection_block = (
+            "detection:\n"
+            "    selection:\n"
+            "        TargetObject|contains:\n"
+            "            - 'TODO'  # registry key path\n"
+            "    condition: selection\n"
+        )
+    elif cat in ("file_event", "file_access", "file_change", "file_delete"):
+        detection_block = (
+            "detection:\n"
+            "    selection:\n"
+            "        TargetFilename|contains:\n"
+            "            - 'TODO'  # file path or name pattern\n"
+            "    condition: selection\n"
+        )
+    elif cat == "network_connection":
+        detection_block = (
+            "detection:\n"
+            "    selection:\n"
+            "        Initiated: 'true'\n"
+            "        DestinationPort:\n"
+            "            - 0  # TODO: target port(s)\n"
+            "    condition: selection\n"
+        )
+    elif cat == "process_access":
+        detection_block = (
+            "detection:\n"
+            "    selection:\n"
+            "        TargetImage|endswith:\n"
+            "            - '\\\\TODO.exe'  # target process\n"
+            "        GrantedAccess|contains:\n"
+            "            - '0x0'  # TODO: access mask(s)\n"
+            "    condition: selection\n"
+        )
+    elif cat == "image_load":
+        detection_block = (
+            "detection:\n"
+            "    selection:\n"
+            "        ImageLoaded|endswith:\n"
+            "            - '\\\\TODO.dll'\n"
+            "    filter_signed:\n"
+            "        Signed: 'true'\n"
+            "    condition: selection and not filter_signed\n"
+        )
+    elif cat == "ps_script":
+        detection_block = (
+            "detection:\n"
+            "    selection:\n"
+            "        ScriptBlockText|contains:\n"
+            "            - 'TODO'  # PowerShell pattern\n"
+            "    condition: selection\n"
+        )
+    elif svc == "security":
+        detection_block = (
+            "detection:\n"
+            "    selection:\n"
+            "        EventID:\n"
+            "            - 0  # TODO: relevant EventID(s)\n"
+            "    filter_machine_accounts:\n"
+            "        SubjectUserName|endswith: '$'\n"
+            "    condition: selection and not filter_machine_accounts\n"
+        )
+    else:
+        detection_block = (
+            "detection:\n"
+            "    selection:\n"
+            "        # TODO: add detection conditions\n"
+            "    condition: selection\n"
+        )
+
+    # Short description: first sentence of ATT&CK description, citations/links stripped
+    full_desc = re.sub(r"\(Citation:[^)]+\)", "", info.get("description", "")).strip()
+    full_desc = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", full_desc)  # strip markdown links
+    m = re.search(r"\.(\s|$)", full_desc)
+    short_desc = (full_desc[: m.end()].strip()) if m else (full_desc or f"Detects {info.get('name', tid)} ({tid}).")
+
+    att_url = "https://attack.mitre.org/techniques/" + tid.replace(".", "/") + "/"
+
+    return (
+        f"title: Potential {info.get('name', tid)} Activity\n"
+        f"id: {uuid.uuid4()}\n"
+        f"status: experimental\n"
+        f"description: |\n"
+        f"    {short_desc}\n"
+        f"references:\n"
+        f"    - {att_url}\n"
+        f"author: TODO\n"
+        f"date: {_date.today().isoformat()}\n"
+        f"tags:\n"
+        f"{tags_yaml}\n"
+        f"logsource:\n"
+        f"{logsource_yaml}\n"
+        f"{detection_block}"
+        f"falsepositives:\n"
+        f"    - Legitimate administrative activity\n"
+        f"    - TODO: enumerate known false positives\n"
+        f"level: medium\n"
+    )
+
+
+@mcp.tool()
+def suggest_rule(technique_id: str, create_file: bool = False) -> dict:
+    """Suggest a Sigma detection rule template for an ATT&CK technique.
+
+    Checks existing coverage first. If the technique is a gap, generates a
+    Sigma rule skeleton guided by ATT&CK data sources and detection guidance.
+    Optionally writes the template to the rules/ directory.
+
+    Args:
+        technique_id: ATT&CK technique ID, e.g. "T1558.004" or "T1110.003".
+        create_file:  If True, write the template to rules/<logsource_category>/
+                      so it can be refined and committed. Defaults to False.
+
+    Returns:
+        coverage_status:    "covered", "partial", or "gap"
+        existing_rules:     list of existing rule summaries covering this technique
+        data_sources:       ATT&CK data sources for the technique
+        detection_guidance: ATT&CK detection notes (truncated)
+        suggested_logsource: recommended Sigma log source
+        template:           Sigma YAML template string
+        file_path:          path written (only present when create_file=True)
+    """
+    tid = technique_id.strip().upper()
+    if not re.match(r"^T\d{4}(\.\d{3})?$", tid):
+        return {"error": f"'{technique_id}' is not a valid ATT&CK technique ID (expected T1234 or T1234.001)."}
+
+    attack_index = _get_attack_index()
+    info = attack_index.get(tid)
+    if info is None:
+        return {
+            "error": f"Technique '{tid}' not found in ATT&CK data.",
+            "note": "Ensure mappings/enterprise-attack.json is present.",
+        }
+
+    # Check existing coverage
+    sigma_rules = _load_sigma_rules()
+    technique_to_rules: dict[str, list[dict]] = {}
+    for path, data in sigma_rules:
+        summary = _rule_summary(path, data)
+        for t in summary["techniques"]:
+            technique_to_rules.setdefault(t, []).append(summary)
+
+    existing = technique_to_rules.get(tid, [])
+
+    if existing:
+        coverage_status = "covered"
+    elif not info.get("is_subtechnique"):
+        subtechs = [t for t in attack_index if t.startswith(tid + ".")]
+        covered_subs = [t for t in subtechs if t in technique_to_rules]
+        coverage_status = "partial" if covered_subs else "gap"
+    else:
+        coverage_status = "gap"
+
+    data_sources = info.get("data_sources", [])
+    logsource = _suggest_logsource(data_sources)
+
+    detection_notes = re.sub(r"\(Citation:[^)]+\)", "", info.get("detection", "")).strip()
+
+    template = _build_rule_template(tid, info)
+
+    result: dict = {
+        "technique_id": tid,
+        "name": info.get("name"),
+        "tactics": info.get("tactics"),
+        "coverage_status": coverage_status,
+        "existing_rule_count": len(existing),
+        "existing_rules": existing,
+        "data_sources": data_sources,
+        "detection_guidance": detection_notes[:600] if detection_notes else "",
+        "suggested_logsource": logsource,
+        "template": template,
+    }
+
+    if create_file:
+        cat = logsource.get("category") or logsource.get("service", "other")
+        out_dir = _SIGMA_RULES_DIR / cat
+        out_dir.mkdir(parents=True, exist_ok=True)
+        name_slug = re.sub(r"[^a-z0-9]+", "_", info.get("name", tid).lower()).strip("_")[:35]
+        filename = f"attack_{tid.lower().replace('.', '_')}_{name_slug}.yml"
+        out_path = out_dir / filename
+        out_path.write_text(template, encoding="utf-8")
+        result["file_path"] = str(out_path)
+
+    return result
 
 
 # ── CyberChef helpers ──────────────────────────────────────────────────────
@@ -529,7 +1159,13 @@ def cyberchef(
 
 
 def main() -> None:
-    mcp.run(transport="stdio")
+    print("hayabusa MCP server starting", file=sys.stderr, flush=True)
+    if _http_mode:
+        mcp.run(transport="streamable-http")
+    elif _sse_mode:
+        mcp.run(transport="sse")
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

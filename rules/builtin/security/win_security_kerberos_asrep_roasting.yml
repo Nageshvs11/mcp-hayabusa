@@ -1,0 +1,40 @@
+title: AS-REP Roasting via Kerberos TGT Request With Pre-Auth Disabled
+id: 3e2f1b2c-4d5e-11ee-be56-0242ac120002
+status: experimental
+description: |
+    Detects AS-REP Roasting by monitoring Event 4768 (Kerberos TGT request) for accounts
+    with Kerberos pre-authentication disabled (PreAuthType: 0). Attackers request AS-REP
+    responses for such accounts without knowing the password, then crack the encrypted
+    ticket offline to recover credentials. Two variants are detected:
+      - RC4 (0x17): classic AS-REP Roast; highest crackability offline
+      - AES256 (0x12): modern variant; slower to crack but evades RC4-only detections
+references:
+    - https://attack.mitre.org/techniques/T1558/004/
+    - https://medium.com/system-weakness/detecting-as-rep-roasting-attacks-b5b3965f9714
+    - https://docs.microsoft.com/en-us/windows/security/threat-protection/auditing/event-4768
+author: ANosir (original), updated 2026-05-26
+date: 2025-05-22
+modified: 2026-05-26
+tags:
+    - attack.credential-access
+    - attack.t1558.004
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4768
+        Status: '0x0'           # success — ticket was issued
+        PreAuthType: 0          # DONT_REQ_PREAUTH flag is set on the account
+        ServiceName: 'krbtgt'
+        TicketEncryptionType:
+            - '0x17'            # RC4-HMAC — easiest to crack offline
+            - '0x12'            # AES256-CTS — modern variant
+    filter_machine_accounts:
+        # Machine accounts legitimately request tickets without pre-auth in some configs
+        TargetUserName|endswith: '$'
+    condition: selection and not filter_machine_accounts
+falsepositives:
+    - Legacy service accounts configured without pre-authentication for compatibility
+    - Accounts deliberately set DONT_REQ_PREAUTH for non-standard Kerberos clients
+level: high

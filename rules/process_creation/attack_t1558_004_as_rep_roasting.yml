@@ -1,0 +1,52 @@
+title: AS-REP Roasting Tool Execution
+id: 5c72cee5-9238-414b-a0bc-aa9fb332fb76
+status: experimental
+description: |
+    Detects execution of tools commonly used to perform AS-REP Roasting (T1558.004).
+    AS-REP Roasting targets Kerberos accounts with pre-authentication disabled
+    (DONT_REQ_PREAUTH flag), requesting an AS-REP encrypted with the account password
+    hash and cracking it offline. Covers Rubeus, Impacket GetNPUsers, Invoke-ASREPRoast,
+    and kerbrute.
+references:
+    - https://attack.mitre.org/techniques/T1558/004/
+    - https://blog.harmj0y.net/activedirectory/roasting-as-reps/
+    - https://github.com/GhostPack/Rubeus
+    - https://github.com/fortra/impacket
+author: TODO
+date: 2026-05-26
+tags:
+    - attack.credential-access
+    - attack.t1558.004
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    # Rubeus asreproast subcommand
+    selection_rubeus:
+        CommandLine|contains:
+            - 'asreproast'
+    # Impacket GetNPUsers — by image name or characteristic flags
+    selection_impacket_image:
+        Image|endswith:
+            - '\GetNPUsers.py'
+            - '\GetNPUsers.exe'
+    selection_impacket_cli:
+        CommandLine|contains|all:
+            - 'GetNPUsers'
+            - '-request'
+    # PowerView / PowerSploit
+    selection_powershell:
+        CommandLine|contains:
+            - 'Invoke-ASREPRoast'
+            - 'Get-ASREPHash'
+    # kerbrute asreproast subcommand
+    selection_kerbrute:
+        Image|endswith:
+            - '\kerbrute.exe'
+            - '\kerbrute'
+        CommandLine|contains:
+            - 'asreproast'
+    condition: 1 of selection_*
+falsepositives:
+    - Authorised penetration testing or red team exercises
+level: high

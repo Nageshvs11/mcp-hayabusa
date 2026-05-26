@@ -5,3 +5,5 @@ hayabusa/
 samples/
 .pytest_cache/
 .claude/settings.local.json
+mappings/enterprise-attack.json
+sigma-rules/
