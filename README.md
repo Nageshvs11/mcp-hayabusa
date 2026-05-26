@@ -25,6 +25,14 @@ This fetches the latest Hayabusa release for your platform and installs it to `.
 
 ## Usage
 
+### With Claude Code
+
+The repo includes `.mcp.json`, so the `scan_evtx` tool is available automatically in any Claude Code session opened from this directory — no extra configuration needed.
+
+```bash
+claude  # the hayabusa MCP server starts alongside the session
+```
+
 ### With Claude Desktop
 
 Add to your `claude_desktop_config.json`:
