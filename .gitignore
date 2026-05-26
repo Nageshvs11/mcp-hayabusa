@@ -4,5 +4,4 @@ __pycache__/
 hayabusa/
 samples/
 .pytest_cache/
-.mcp.json
 .claude/settings.local.json

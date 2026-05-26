@@ -1,8 +1,1 @@
-{
-  "mcpServers": {
-    "hayabusa": {
-      "command": ".venv/bin/python",
-      "args": ["server.py"]
-    }
-  }
-}
+{}
