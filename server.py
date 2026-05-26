@@ -338,7 +338,7 @@ def _cc_apply(current: str, op: str, args: dict) -> str:
         return base64.b85encode(current.encode()).decode()
 
     if key == "from_hex":
-        cleaned = re.sub(r"[\s:\-]", "", current).lstrip("0x").lstrip("0X")
+        cleaned = re.sub(r"(?i)^0x", "", re.sub(r"[\s:\-]", "", current))
         return bytes.fromhex(cleaned).decode("utf-8", errors="replace")
 
     if key == "to_hex":
